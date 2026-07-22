@@ -241,11 +241,13 @@ class Inference:
                     linear_vel_value_limit = maxw * np.sign(linear_vel_value) * np.abs(rd)
                     angular_vel_value_limit = maxw * np.sign(angular_vel_value)
 
-        # Save behavior
-        self.save_robot_behavior(
-            current_image_PIL, self.goal_image_PIL, goal_pose_loc_norm, waypoints[0],
-            linear_vel_value_limit, angular_vel_value_limit, metric_waypoint_spacing, modality_id.cpu().numpy()
-        )
+        # Save behavior (throttled/optional -- matplotlib is too slow to run
+        # synchronously every tick without bottlenecking the control loop)
+        if ENABLE_DEBUG_PLOTTING and (self.count_id % PLOT_EVERY_N_TICKS == 0):
+            self.save_robot_behavior(
+                current_image_PIL, self.goal_image_PIL, goal_pose_loc_norm, waypoints[0],
+                linear_vel_value_limit, angular_vel_value_limit, metric_waypoint_spacing, modality_id.cpu().numpy()
+            )
 
         print("linear angular", linear_vel_value_limit, angular_vel_value_limit)
         return linear_vel_value_limit, angular_vel_value_limit
@@ -584,6 +586,13 @@ pose_goal = _GOAL_MODE_FLAGS[GOAL_MODE]["pose_goal"]
 satellite = _GOAL_MODE_FLAGS[GOAL_MODE]["satellite"]
 image_goal = _GOAL_MODE_FLAGS[GOAL_MODE]["image_goal"]
 lan_prompt = _GOAL_MODE_FLAGS[GOAL_MODE]["lan_prompt"]
+
+# matplotlib debug plotting is slow (full-res imshow + savefig at figure size
+# 34x16in/80dpi, done synchronously inside the control loop) and will bottleneck
+# or hang a real-time 3Hz loop if left on indefinitely. Use it for short sanity
+# checks (bench testing, first WHILL runs) then turn it off for normal operation.
+ENABLE_DEBUG_PLOTTING = True   # set False to fully skip save_robot_behavior
+PLOT_EVERY_N_TICKS = 5         # only save 1 out of every N ticks when enabled
 # ===============================================================
 # Main Entry
 # ===============================================================
