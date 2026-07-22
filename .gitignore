@@ -1,0 +1,24 @@
+# ROS2 generated folders
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+
+# VS Code
+.vscode/
+
+# JetBrains
+.idea/
+
+# Linux
+*.swp
+.DS_Store
+
+# Model checkpoints (optional - uncomment if needed)
+# *.ckpt
+# *.pt
+# *.pth
+# *.safetensors
