@@ -12,6 +12,7 @@ import cv2
 import sys, os
 sys.path.insert(0, '..')
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Joy
 import time, math, json
 from typing import Optional, Tuple, Type, Dict
 from dataclasses import dataclass
@@ -219,7 +220,7 @@ class Inference:
         angular_vel_value = np.clip(angular_vel_value, -1.0, 1.0)
 
         # Velocity limitation
-        maxv, maxw = 0.3, 0.3
+        maxv, maxw = 0.05, 0.3
         if np.abs(linear_vel_value) <= maxv:
             if np.abs(angular_vel_value) <= maxw:
                 linear_vel_value_limit = linear_vel_value
@@ -569,7 +570,7 @@ def define_model(cfg: InferenceConfig) -> None:
 # Goal modality selection
 # ===============================================================
 
-GOAL_MODE = "pose"  # options: "language", "pose", "image", "language_pose"
+GOAL_MODE = "image"  # options: "language", "pose", "image", "language_pose"
 # NOTE: these are the ONLY 4 combinations validated against run_forward_pass's
 # modality_id lookup table for this checkpoint. Do not combine "image" with
 # "language" (no modality_id is defined for that combo -> UnboundLocalError).
@@ -613,12 +614,39 @@ class OmniVLANode(Node):
             10,
         )
 
-        # Publish robot velocity
+        # Publish robot velocity via the WHILL joystick command path.
+        # NOTE: /whill/controller/cmd_vel (Twist/SetVelocity) is ignored by
+        # this WHILL's firmware. /whill/controller/joy (Joy/SetJoystick)
+        # is the path confirmed to actually work (same one teleop uses).
+        #
+        # NOTE ON POWER: WHILL ignores motion commands until SetPower(1) is
+        # sent once. We do NOT call it from here -- this node runs on a
+        # separate PC that doesn't have the whill_msgs package built, and
+        # more importantly, power-on is already handled automatically by
+        # `pixi run teleop`'s ps4_whill_teleop.py on the robot laptop (see
+        # its startup log: "WHILL serial control enabled (SetPower 1)").
+        # Make sure that teleop stack is running BEFORE this node, so the
+        # WHILL is already powered on and listening.
         self.cmd_pub = self.create_publisher(
-            Twist,
-            "/cmd_vel",
+            Joy,
+            "/whill/controller/joy",
             10,
         )
+
+        # --------------------------
+        # Trajectory logging (dead-reckoning from commanded velocity)
+        # --------------------------
+        # NOTE: this integrates our OWN commanded (linear, angular) over time
+        # using a standard unicycle model -- it's an estimate, not real
+        # odometry (no slip/drift correction). Good enough for a rough
+        # "path driven" plot; if WHILL publishes real odometry later,
+        # switch to that for accuracy.
+        self.traj_x = [0.0]
+        self.traj_y = [0.0]
+        self.traj_theta = [0.0]
+        self._last_tick_time = time.time()
+        self.trajectory_save_dir = os.path.join(OMNIVLA_REPO_ROOT, "inference")
+        os.makedirs(self.trajectory_save_dir, exist_ok=True)
 
         # --------------------------
         # Goal definition
@@ -652,7 +680,7 @@ class OmniVLANode(Node):
 
         self.inference = Inference(
             save_dir=os.path.join(OMNIVLA_REPO_ROOT, "inference"),
-            lan_inst_prompt="move toward blue trash bin",
+            lan_inst_prompt="go to the chair",
             goal_utm=goal_utm,
             goal_compass=goal_compass,
             goal_image_PIL=goal_image_PIL,
@@ -696,22 +724,83 @@ class OmniVLANode(Node):
             NUM_PATCHES=self.NUM_PATCHES,
         )
 
-        cmd = Twist()
-        cmd.linear.x = float(linear)
-        cmd.angular.z = float(angular)
+        # Convert (linear m/s, angular rad/s) into the normalized [-1, 1]
+        # joystick axes that /whill/controller/joy expects (axes[0]=turn,
+        # axes[1]=forward, matching ps4_whill_teleop.py's [lr, fb] order).
+        #
+        # CAUTION: the exact m/s <-> axes scaling depends on this WHILL's
+        # configured max speed profile.
+        # Calibrated from a real WHILL test: axes=0.2 (fb only, forward) produced
+        # a "not too fast, not too slow" speed with a constant manual command.
+        # AXES_SCALE=3.0 maps our model's max linear output (maxv=0.05 m/s) to
+        # axes~=0.15, slightly under that reference point as a safety margin
+        # for the first autonomous run, since live model output is less
+        # predictable than a constant test value. Re-tune after watching the
+        # first run: raise if too slow, lower if too fast/jerky.
+        AXES_SCALE = 3.0
+        lr = max(-1.0, min(1.0, float(angular) * AXES_SCALE))
+        fb = max(-1.0, min(1.0, float(linear) * AXES_SCALE))
+
+        cmd = Joy()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.axes = [lr, fb]
 
         self.cmd_pub.publish(cmd)
+
+        # dead-reckoning trajectory logging, using the actual clamped
+        # commanded velocities (what really got sent), not raw model output
+        self._update_trajectory(float(linear), float(angular))
+
+    def _update_trajectory(self, linear, angular):
+        now = time.time()
+        dt = now - self._last_tick_time
+        self._last_tick_time = now
+        dt = min(dt, 1.0)  # guard against a huge dt on first tick / after a pause
+
+        theta = self.traj_theta[-1] + angular * dt
+        x = self.traj_x[-1] + linear * math.cos(theta) * dt
+        y = self.traj_y[-1] + linear * math.sin(theta) * dt
+
+        self.traj_theta.append(theta)
+        self.traj_x.append(x)
+        self.traj_y.append(y)
+
+    def save_trajectory_plot(self):
+        if len(self.traj_x) < 2:
+            self.get_logger().info("Trajectory too short, skipping plot save")
+            return
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.plot(self.traj_x, self.traj_y, "-b", linewidth=2, label="Estimated path")
+        ax.plot(self.traj_x[0], self.traj_y[0], "go", markersize=12, label="Start")
+        ax.plot(self.traj_x[-1], self.traj_y[-1], "rs", markersize=12, label="End")
+        ax.set_xlabel("x (m, dead-reckoned)")
+        ax.set_ylabel("y (m, dead-reckoned)")
+        ax.set_title("WHILL estimated trajectory (dead-reckoning, not ground-truth odometry)")
+        ax.axis("equal")
+        ax.grid(True)
+        ax.legend()
+        save_path = os.path.join(self.trajectory_save_dir, f"trajectory_{int(time.time())}.png")
+        fig.savefig(save_path)
+        plt.close(fig)
+        self.get_logger().info(f"Saved trajectory plot to {save_path}")
+
+    def destroy_node(self):
+        self.save_trajectory_plot()
+        super().destroy_node()
+
 def main():
 
     rclpy.init()
 
     node = OmniVLANode()
 
-    rclpy.spin(node)
-
-    node.destroy_node()
-
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
